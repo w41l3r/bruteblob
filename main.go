@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -25,16 +26,28 @@ type Result struct {
 	PublicMsg string
 }
 
+// resolverPool distributes DNS queries across multiple resolvers in round-robin.
+type resolverPool struct {
+	resolvers []*net.Resolver
+	counter   atomic.Uint64
+}
+
+func (p *resolverPool) next() *net.Resolver {
+	idx := p.counter.Add(1) - 1
+	return p.resolvers[idx%uint64(len(p.resolvers))]
+}
+
 var (
-	flagWordlist  = flag.String("w", "", "wordlist file (one name per line)")
-	flagThreads   = flag.Int("t", 50, "concurrent threads")
-	flagOutput    = flag.String("o", "", "output file for hits (optional)")
-	flagTimeout   = flag.Int("timeout", 5, "DNS/HTTP timeout in seconds")
-	flagOnlyFound = flag.Bool("found", false, "only print names that exist (DNS hit)")
-	flagQuiet     = flag.Bool("q", false, "suppress banner and summary")
-	flagPrefix    = flag.String("prefix", "", "prefix to prepend to every word (e.g. acme-)")
-	flagSuffix    = flag.String("suffix", "", "suffix to append to every word (e.g. -prod)")
-	flagNoHTTP    = flag.Bool("no-http", false, "skip HTTP probe (DNS enumeration only)")
+	flagWordlist   = flag.String("w", "", "wordlist file (one name per line)")
+	flagResolvers  = flag.String("r", "", "file with DNS resolver IPs (one per line, e.g. 8.8.8.8 or 8.8.8.8:53)")
+	flagThreads    = flag.Int("t", 50, "concurrent threads")
+	flagOutput     = flag.String("o", "", "output file for hits (optional)")
+	flagTimeout    = flag.Int("timeout", 5, "DNS/HTTP timeout in seconds")
+	flagOnlyFound  = flag.Bool("found", false, "only print names that exist (DNS hit)")
+	flagQuiet      = flag.Bool("q", false, "suppress banner and summary")
+	flagPrefix     = flag.String("prefix", "", "prefix to prepend to every word (e.g. acme-)")
+	flagSuffix     = flag.String("suffix", "", "suffix to append to every word (e.g. -prod)")
+	flagNoHTTP     = flag.Bool("no-http", false, "skip HTTP probe (DNS enumeration only)")
 )
 
 func main() {
@@ -68,7 +81,15 @@ func main() {
 	}
 
 	timeout := time.Duration(*flagTimeout) * time.Second
-	resolver := &net.Resolver{PreferGo: true}
+
+	pool, err := buildResolverPool(*flagResolvers, timeout)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[!] %v\n", err)
+		os.Exit(1)
+	}
+	if !*flagQuiet {
+		fmt.Fprintf(os.Stderr, "[*] resolvers loaded: %d\n", len(pool.resolvers))
+	}
 
 	httpClient := &http.Client{
 		Timeout: timeout,
@@ -87,7 +108,7 @@ func main() {
 		go func() {
 			defer wg.Done()
 			for name := range jobs {
-				results <- probe(name, resolver, httpClient, timeout)
+				results <- probe(name, pool.next(), httpClient, timeout)
 			}
 		}()
 	}
@@ -104,8 +125,7 @@ func main() {
 			if line == "" || strings.HasPrefix(line, "#") {
 				continue
 			}
-			candidate := *flagPrefix + line + *flagSuffix
-			jobs <- candidate
+			jobs <- *flagPrefix + line + *flagSuffix
 		}
 		close(jobs)
 	}()
@@ -134,6 +154,53 @@ func main() {
 	}
 }
 
+// buildResolverPool creates a pool from a resolver file. Falls back to the
+// system resolver when no file is provided.
+func buildResolverPool(path string, timeout time.Duration) (*resolverPool, error) {
+	if path == "" {
+		return &resolverPool{
+			resolvers: []*net.Resolver{{PreferGo: true}},
+		}, nil
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("cannot open resolver file: %w", err)
+	}
+	defer f.Close()
+
+	var resolvers []*net.Resolver
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		addr := strings.TrimSpace(scanner.Text())
+		if addr == "" || strings.HasPrefix(addr, "#") {
+			continue
+		}
+		resolvers = append(resolvers, makeResolver(addr, timeout))
+	}
+
+	if len(resolvers) == 0 {
+		return nil, fmt.Errorf("resolver file is empty or has no valid entries")
+	}
+
+	return &resolverPool{resolvers: resolvers}, nil
+}
+
+// makeResolver returns a net.Resolver that sends all queries to addr over UDP.
+// addr may be "1.2.3.4" or "1.2.3.4:53".
+func makeResolver(addr string, timeout time.Duration) *net.Resolver {
+	if !strings.Contains(addr, ":") {
+		addr = addr + ":53"
+	}
+	return &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			d := net.Dialer{Timeout: timeout}
+			return d.DialContext(ctx, "udp", addr)
+		},
+	}
+}
+
 func probe(name string, resolver *net.Resolver, client *http.Client, timeout time.Duration) Result {
 	host := name + blobSuffix
 	r := Result{Name: name}
@@ -151,7 +218,6 @@ func probe(name string, resolver *net.Resolver, client *http.Client, timeout tim
 		return r
 	}
 
-	// Try to list containers at account level
 	url := fmt.Sprintf("https://%s/?comp=list", host)
 	resp, err := client.Get(url)
 	if err != nil {
@@ -169,6 +235,14 @@ func probe(name string, resolver *net.Resolver, client *http.Client, timeout tim
 		r.PublicMsg = "ANONYMOUS LISTING — containers exposed"
 	case resp.StatusCode == 200:
 		r.PublicMsg = "200 OK (unexpected body)"
+	case resp.StatusCode == 409 && azErr == "PublicAccessNotPermitted":
+		r.PublicMsg = "409 PublicAccessNotPermitted (public access disabled at account level)"
+	case resp.StatusCode == 409:
+		if azErr != "" {
+			r.PublicMsg = "409 " + azErr
+		} else {
+			r.PublicMsg = "409 " + strings.TrimPrefix(resp.Status, "409 ")
+		}
 	case resp.StatusCode == 403:
 		if azErr != "" {
 			r.PublicMsg = "403 " + azErr
