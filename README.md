@@ -2,13 +2,14 @@
 
 Azure Blob Storage enumerator for bug bounty and security research.
 
-Exploits the fact that `<name>.blob.core.windows.net` only resolves via DNS if the storage account actually exists. Non-existent accounts return NXDOMAIN. This allows fast, low-noise enumeration using a wordlist, followed by an HTTP probe to detect publicly accessible (anonymous) containers.
+Exploits the fact that `<name>.blob.core.windows.net` only resolves via DNS if the storage account actually exists. Non-existent accounts return NXDOMAIN. This allows fast, low-noise enumeration using a wordlist, followed by an HTTP probe to classify the access level and an optional container brute-force on every confirmed account.
 
 ## How it works
 
 1. **DNS probe** — resolves `<word>.blob.core.windows.net`. Success means the storage account exists.
-2. **HTTP probe** — requests `/?comp=list` to check for anonymous container listing and classify the access level based on the HTTP status and Azure error code in the response body.
-3. **Authenticated probe** *(optional, `-auth`)* — for each DNS hit, runs `az storage container list --auth-mode login` using the active Azure CLI session to test access with real credentials.
+2. **HTTP probe** — requests `/?comp=list` at account level to classify access (public listing, private, or blocked).
+3. **Container brute-force** *(optional, `-containers`)* — for every confirmed account, tests each word in the container wordlist as a container name via `/<container>?restype=container&comp=list`.
+4. **Authenticated probe** *(optional, `-auth`)* — runs `az storage container list --auth-mode login` using the active Azure CLI session to test access with real credentials.
 
 ## Installation
 
@@ -32,7 +33,9 @@ For authenticated mode, also install the [Azure CLI](https://aka.ms/installazure
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-w` | *(required)* | Path to wordlist (one name per line) |
+| `-w` | *(required)* | Wordlist for storage account names (one per line) |
+| `-containers` | — | Wordlist for container brute-force on found accounts |
+| `-container-threads` | `10` | Concurrent container probes per account |
 | `-r` | — | File with DNS resolver IPs, one per line (e.g. `8.8.8.8` or `8.8.8.8:53`) |
 | `-t` | `50` | Concurrent threads |
 | `-timeout` | `5` | DNS/HTTP timeout in seconds (auth probe uses a fixed 30 s) |
@@ -50,56 +53,87 @@ For authenticated mode, also install the [Azure CLI](https://aka.ms/installazure
 # Basic enumeration
 ./bruteblob -w wordlist.txt
 
-# Show only accounts that exist, save to file
+# Only existing accounts, save to file
 ./bruteblob -w wordlist.txt -found -o hits.txt
 
-# Target-specific: add company prefix and environment suffixes
-./bruteblob -w words.txt -prefix "acme-" -suffix "-prod" -found
-./bruteblob -w words.txt -prefix "acme-" -suffix "-dev"  -found
-./bruteblob -w words.txt -prefix "acme-" -suffix "-stg"  -found
+# Container brute-force on found accounts
+./bruteblob -w wordlist.txt -containers wordlists/containers.txt -found
 
-# DNS-only (faster, no HTTP noise)
+# Target-specific: prefix + container brute + auth
+./bruteblob -w words.txt -prefix "acme-" -containers wordlists/containers.txt -auth -found
+
+# Custom resolvers + container brute, full pipeline
+./bruteblob -w wordlist.txt -r resolvers.txt -containers wordlists/containers.txt -t 30 -container-threads 20 -found -o hits.txt -q
+
+# DNS-only (fastest, no HTTP noise)
 ./bruteblob -w wordlist.txt -no-http -found
-
-# Custom resolvers (round-robin across all)
-./bruteblob -w wordlist.txt -r resolvers.txt -found
-
-# Authenticated mode (insider-threat / leaked credential simulation)
-./bruteblob -w wordlist.txt -auth -found
-
-# Full pipeline: custom resolvers + auth + output file
-./bruteblob -w wordlist.txt -r resolvers.txt -auth -found -o hits.txt
 ```
 
 ## Output
 
-### Anonymous mode (default)
+### Anonymous mode with container brute-force
 
 ```
 [ ] nonexistent.blob.core.windows.net
-[+] target-prod.blob.core.windows.net    ip=20.150.x.x   409 PublicAccessNotPermitted (public access disabled at account level)
-[+] target-files.blob.core.windows.net   ip=20.150.x.x   403 AuthenticationFailed
-[!] target-backup.blob.core.windows.net  ip=20.60.x.x    ANONYMOUS LISTING — containers exposed
+[+] target-prod.blob.core.windows.net      ip=20.150.x.x   409 PublicAccessNotPermitted (public access disabled at account level)
+    [!] account-level Block Public Access active — container 403s do not confirm existence
+    [BLK] /logs     → 403 PublicAccessNotPermitted (account policy, not container-specific)
+    [BLK] /backup   → 403 PublicAccessNotPermitted (account policy, not container-specific)
+[+] target-files.blob.core.windows.net     ip=20.150.x.x   403 AuthenticationFailed
+    [---] /logs     → 403 AuthorizationFailure
+    [---] /backup   → 403 AuthorizationFailure
+[!] target-backup.blob.core.windows.net    ip=20.60.x.x    ANONYMOUS LISTING — containers exposed
+    [PUB] /data     → PUBLIC — 34 blob(s): report.csv, dump.sql, keys.json, ...
+    [PUB] /logs     → PUBLIC — 8 blob(s): app-2024.log, error.log, ...
+    [---] /private  → 403 AuthorizationFailure
 ```
 
-### Authenticated mode (`-auth`)
-
-Each DNS hit gets an additional `[AUTH]` line:
+### Authenticated mode (`-auth`) with container brute-force
 
 ```
-[+] target-prod.blob.core.windows.net    ip=20.150.x.x   409 PublicAccessNotPermitted (public access disabled at account level)
-    [AUTH] access denied — AuthorizationPermissionMismatch: ...
-[+] target-files.blob.core.windows.net   ip=20.150.x.x   403 AuthenticationFailed
+[+] target-files.blob.core.windows.net     ip=20.150.x.x   403 AuthenticationFailed
+    [---] /logs    → 403 AuthorizationFailure
+    [---] /backup  → 403 AuthorizationFailure
     [AUTH] ACCESS GRANTED — 3 container(s): logs(private), backups(private), exports(blob)
 ```
 
-| Output tag | Meaning |
-|------------|---------|
+### Tag reference
+
+| Tag | Meaning |
+|-----|---------|
 | `[ ]` | DNS failed — account does not exist |
 | `[+]` | Account exists — details from HTTP probe |
 | `[!]` | Account exists and **anonymous listing enabled** (critical finding) |
+| `[PUB]` | Container exists and is **publicly listable** — blobs exposed |
+| `[---]` | Container exists but access denied (403 container-specific) |
+| `[BLK]` | 403 caused by **account-level Block Public Access** — cannot confirm container existence |
 | `[AUTH] ACCESS GRANTED` | Authenticated access confirmed — container list included |
 | `[AUTH] access denied` | Credentials don't have access to this account |
+
+## Container brute-force (`-containers`)
+
+For every storage account confirmed to exist via DNS, the tool probes each word in the container wordlist with:
+
+```
+GET https://<account>.blob.core.windows.net/<container>?restype=container&comp=list
+```
+
+| Response | Meaning |
+|----------|---------|
+| `200` + `<EnumerationResults>` | Container exists and is **publicly listable** — blob names and count shown |
+| `403` | Container exists, access denied — Azure error code extracted from XML |
+| `404` | Container does not exist — silently discarded |
+| `409` | Container exists, conflict (e.g. account-level policy) |
+
+### Block Public Access caveat
+
+When the account-level HTTP probe returns `409 PublicAccessNotPermitted`, Azure enforces the block **before** checking container existence. This means every container probe returns 403 regardless of whether the container actually exists, making the results unreliable for confirming existence.
+
+The tool detects this automatically:
+- Container results under a blocked account use the `[BLK]` tag instead of `[---]`
+- A warning line is printed before the container list: `[!] account-level Block Public Access active — container 403s do not confirm existence`
+
+In this scenario, container brute-force is still useful when combined with `-auth`, since authenticated requests bypass the public access restriction and can confirm existence.
 
 ## HTTP status reference
 
@@ -114,27 +148,42 @@ Azure returns different HTTP status codes and XML error codes depending on the a
 | `404` | `ResourceNotFound` | Account exists, no resource at this path |
 | `400` | `InvalidQueryParameterValue` | Account exists, malformed request |
 
-> **Note:** `409 PublicAccessNotPermitted` and `403 AuthenticationFailed` are the two most common responses for existing private accounts. The 409 indicates the "Allow Blob public access" setting is explicitly disabled at the account level — a stronger security posture than a plain 403.
+> `409 PublicAccessNotPermitted` is a stronger security posture than a plain `403` — it means the "Allow Blob public access" setting is explicitly disabled at the account level, overriding any container-level policy.
 
 ## Authenticated mode (`-auth`)
 
 When `-auth` is set, the tool:
 
-1. Checks that `az` is in `PATH` (fails fast if not found).
+1. Checks that `az` is in `PATH` (fails fast with install link if not found).
 2. Runs `az account show` — if no active session exists, launches `az login` interactively and waits for completion.
 3. After DNS confirms an account exists, runs:
    ```
    az storage container list --account-name <name> --auth-mode login --output json
    ```
-4. On success, parses the container list and shows each container name and its public access level (`private`, `blob`, or `container`).
+4. On success, shows each container name and its public access level (`private`, `blob`, or `container`).
 5. On failure, extracts and displays the Azure error code from the CLI output.
 
 **Use cases:**
 - Simulate an insider-threat scenario with valid domain credentials
 - Test access with a leaked or compromised Azure identity
 - Validate the blast radius of a compromised service principal
+- Confirm container existence on accounts with account-level Block Public Access (where anonymous probes are unreliable)
 
-> The auth probe runs with a 30-second timeout per account to accommodate `az` CLI startup overhead. Use a lower `-t` value (e.g. `-t 10`) when running with `-auth` to avoid spawning too many concurrent `az` processes.
+> The auth probe runs with a 30-second timeout per account. Use `-t 10` or lower when running with `-auth` to avoid spawning too many concurrent `az` processes.
+
+## Concurrency model
+
+```
+outer pool (-t threads)
+  └─ per account: DNS probe → HTTP probe
+       └─ if account exists + -containers set:
+            inner pool (-container-threads per account)
+              └─ per container: GET ?restype=container&comp=list
+       └─ if -auth set:
+            az storage container list (30 s timeout)
+```
+
+With `-t 30` and `-container-threads 20`, up to 30 accounts and 600 container requests may be in-flight simultaneously. Tune to target rate limits.
 
 ## Resolver file format
 
@@ -155,10 +204,15 @@ Queries are distributed across all resolvers in round-robin order. When `-r` is 
 
 ## Wordlist tips
 
-- Start with generic storage-related words: `backup`, `assets`, `files`, `data`, `media`, `uploads`, `logs`, `archive`
-- Add target-specific terms using `-prefix`/`-suffix`: company name, product names, environment names (`-dev`, `-prod`, `-stg`, `-uat`, `-hml`)
-- Combine multiple runs with different prefix/suffix pairs
-- Public wordlists like [SecLists](https://github.com/danielmiessler/SecLists) `Discovery/Web-Content/` can be adapted
+### Account names (`-w`)
+- Generic: `backup`, `assets`, `files`, `data`, `media`, `uploads`, `logs`, `archive`
+- Target-specific with `-prefix`/`-suffix`: `acme-prod`, `acme-backup`, `acme-data-dev`
+- Pre-built wordlists: `wordlists/tim-brasil.txt` (560 entries), `wordlists/sek-group.txt` (608 entries)
+
+### Container names (`-containers`)
+- Use `wordlists/containers.txt` as a starting point — covers logs, backups, config, secrets, environments, databases, and more (189 entries)
+- Add target-specific container names: app name, service name, team names, internal codenames
+- Note: Azure container names must be lowercase and 3–63 characters
 
 ## Legal
 

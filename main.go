@@ -21,19 +21,34 @@ import (
 
 const blobSuffix = ".blob.core.windows.net"
 
+// ── Types ─────────────────────────────────────────────────────────────────────
+
 type azContainer struct {
 	Name       string `json:"name"`
 	Properties struct {
-		PublicAccess string `json:"publicAccess"` // "blob", "container", or ""
+		PublicAccess string `json:"publicAccess"`
 	} `json:"properties"`
 }
 
+// ContainerResult holds the outcome of probing one container within an account.
+type ContainerResult struct {
+	Name        string
+	IsPublic    bool
+	Denied      bool
+	BlobCount   int
+	SampleBlobs []string
+	Msg         string // Azure error code when denied
+}
+
 type Result struct {
-	Name      string
-	Exists    bool
-	IP        string
-	Public    bool
-	PublicMsg string
+	Name             string
+	Exists           bool
+	IP               string
+	Public           bool
+	PublicMsg        string
+	AccountBlocked   bool // account-level Block Public Access (409 PublicAccessNotPermitted)
+	// container brute-force
+	Containers []ContainerResult
 	// authenticated probe
 	AuthChecked    bool
 	AuthOK         bool
@@ -52,19 +67,25 @@ func (p *resolverPool) next() *net.Resolver {
 	return p.resolvers[idx%uint64(len(p.resolvers))]
 }
 
+// ── Flags ─────────────────────────────────────────────────────────────────────
+
 var (
-	flagWordlist  = flag.String("w", "", "wordlist file (one name per line)")
-	flagResolvers = flag.String("r", "", "file with DNS resolver IPs (one per line, e.g. 8.8.8.8 or 8.8.8.8:53)")
-	flagThreads   = flag.Int("t", 50, "concurrent threads")
-	flagOutput    = flag.String("o", "", "output file for hits (optional)")
-	flagTimeout   = flag.Int("timeout", 5, "DNS/HTTP timeout in seconds")
-	flagOnlyFound = flag.Bool("found", false, "only print names that exist (DNS hit)")
-	flagQuiet     = flag.Bool("q", false, "suppress banner and summary")
-	flagPrefix    = flag.String("prefix", "", "prefix to prepend to every word (e.g. acme-)")
-	flagSuffix    = flag.String("suffix", "", "suffix to append to every word (e.g. -prod)")
-	flagNoHTTP    = flag.Bool("no-http", false, "skip HTTP probe (DNS enumeration only)")
-	flagAuth      = flag.Bool("auth", false, "authenticated mode: use 'az' CLI to test access with Azure credentials")
+	flagWordlist      = flag.String("w", "", "wordlist for storage account names (one per line)")
+	flagContainers    = flag.String("containers", "", "wordlist for container brute-force on found accounts")
+	flagContThreads   = flag.Int("container-threads", 10, "concurrent container probes per account")
+	flagResolvers     = flag.String("r", "", "file with DNS resolver IPs (one per line, e.g. 8.8.8.8 or 8.8.8.8:53)")
+	flagThreads       = flag.Int("t", 50, "concurrent threads")
+	flagOutput        = flag.String("o", "", "output file for hits (optional)")
+	flagTimeout       = flag.Int("timeout", 5, "DNS/HTTP timeout in seconds")
+	flagOnlyFound     = flag.Bool("found", false, "only print names that exist (DNS hit)")
+	flagQuiet         = flag.Bool("q", false, "suppress banner and summary")
+	flagPrefix        = flag.String("prefix", "", "prefix to prepend to every word (e.g. acme-)")
+	flagSuffix        = flag.String("suffix", "", "suffix to append to every word (e.g. -prod)")
+	flagNoHTTP        = flag.Bool("no-http", false, "skip HTTP probe (DNS enumeration only)")
+	flagAuth          = flag.Bool("auth", false, "authenticated mode: use 'az' CLI to test access with Azure credentials")
 )
+
+// ── Main ──────────────────────────────────────────────────────────────────────
 
 func main() {
 	flag.Parse()
@@ -93,12 +114,25 @@ func main() {
 		}
 	}
 
-	f, err := os.Open(*flagWordlist)
+	// Load container wordlist once — shared across all workers.
+	var containerNames []string
+	if *flagContainers != "" {
+		var err error
+		containerNames, err = loadWordlist(*flagContainers)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[!] cannot open containers wordlist: %v\n", err)
+			os.Exit(1)
+		}
+		if !*flagQuiet {
+			fmt.Fprintf(os.Stderr, "[*] container wordlist loaded: %d entries\n", len(containerNames))
+		}
+	}
+
+	accounts, err := loadWordlist(*flagWordlist)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[!] cannot open wordlist: %v\n", err)
 		os.Exit(1)
 	}
-	defer f.Close()
 
 	var outFile *os.File
 	if *flagOutput != "" {
@@ -138,7 +172,7 @@ func main() {
 		go func() {
 			defer wg.Done()
 			for name := range jobs {
-				results <- probe(name, pool.next(), httpClient, timeout)
+				results <- probe(name, containerNames, pool.next(), httpClient, timeout)
 			}
 		}()
 	}
@@ -149,13 +183,8 @@ func main() {
 	}()
 
 	go func() {
-		scanner := bufio.NewScanner(f)
-		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if line == "" || strings.HasPrefix(line, "#") {
-				continue
-			}
-			jobs <- *flagPrefix + line + *flagSuffix
+		for _, name := range accounts {
+			jobs <- *flagPrefix + name + *flagSuffix
 		}
 		close(jobs)
 	}()
@@ -175,10 +204,10 @@ func main() {
 		if r.AuthOK {
 			authOK++
 		}
-		lines := formatResult(r)
-		fmt.Println(lines)
+		out := formatResult(r)
+		fmt.Println(out)
 		if outFile != nil && r.Exists {
-			fmt.Fprintln(outFile, lines)
+			fmt.Fprintln(outFile, out)
 		}
 	}
 
@@ -193,7 +222,7 @@ func main() {
 
 // ── DNS + HTTP probe ──────────────────────────────────────────────────────────
 
-func probe(name string, resolver *net.Resolver, client *http.Client, timeout time.Duration) Result {
+func probe(name string, containerNames []string, resolver *net.Resolver, client *http.Client, timeout time.Duration) Result {
 	host := name + blobSuffix
 	r := Result{Name: name}
 
@@ -208,6 +237,10 @@ func probe(name string, resolver *net.Resolver, client *http.Client, timeout tim
 
 	if !*flagNoHTTP {
 		probeHTTP(&r, host, client)
+	}
+
+	if r.Exists && len(containerNames) > 0 {
+		r.Containers = probeContainers(name, containerNames, client, *flagContThreads)
 	}
 
 	if *flagAuth {
@@ -237,6 +270,7 @@ func probeHTTP(r *Result, host string, client *http.Client) {
 		r.PublicMsg = "200 OK (unexpected body)"
 	case resp.StatusCode == 409 && azErr == "PublicAccessNotPermitted":
 		r.PublicMsg = "409 PublicAccessNotPermitted (public access disabled at account level)"
+		r.AccountBlocked = true
 	case resp.StatusCode == 409:
 		if azErr != "" {
 			r.PublicMsg = "409 " + azErr
@@ -262,12 +296,119 @@ func probeHTTP(r *Result, host string, client *http.Client) {
 	}
 }
 
+// ── Container brute-force ─────────────────────────────────────────────────────
+
+// probeContainers tests each name as an Azure Blob container within the account.
+// It sends:
+//
+//	GET https://<account>.blob.core.windows.net/<container>?restype=container&comp=list
+//
+// A 404 means the container does not exist and is silently discarded.
+// A 403 means it exists but access is denied.
+// A 200 with <EnumerationResults> means it exists and is publicly listable.
+func probeContainers(accountName string, names []string, client *http.Client, threads int) []ContainerResult {
+	jobs := make(chan string, len(names))
+	for _, n := range names {
+		jobs <- n
+	}
+	close(jobs)
+
+	resultsCh := make(chan ContainerResult, len(names))
+
+	if threads > len(names) {
+		threads = len(names)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < threads; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for containerName := range jobs {
+				cr := probeOneContainer(accountName, containerName, client)
+				if cr.IsPublic || cr.Denied {
+					resultsCh <- cr
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(resultsCh)
+
+	var out []ContainerResult
+	for cr := range resultsCh {
+		out = append(out, cr)
+	}
+	return out
+}
+
+func probeOneContainer(accountName, containerName string, client *http.Client) ContainerResult {
+	cr := ContainerResult{Name: containerName}
+
+	url := fmt.Sprintf("https://%s%s/%s?restype=container&comp=list",
+		accountName, blobSuffix, containerName)
+
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)
+	resp, err := client.Do(req)
+	if err != nil {
+		return cr
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 32768))
+	bodyStr := string(body)
+	azErr := extractAzureError(bodyStr)
+
+	switch {
+	case resp.StatusCode == 200 && strings.Contains(bodyStr, "<EnumerationResults"):
+		cr.IsPublic = true
+		cr.BlobCount = strings.Count(bodyStr, "<Blob>")
+		cr.SampleBlobs = extractBlobNames(bodyStr, 5)
+
+	case resp.StatusCode == 403:
+		cr.Denied = true
+		if azErr != "" {
+			cr.Msg = azErr
+		} else {
+			cr.Msg = "AccessDenied"
+		}
+
+	case resp.StatusCode == 409:
+		// Container exists but has a conflict (e.g. account-level block).
+		cr.Denied = true
+		if azErr != "" {
+			cr.Msg = azErr
+		} else {
+			cr.Msg = strings.TrimPrefix(resp.Status, "409 ")
+		}
+
+	// 404 = container does not exist → drop silently (cr has zero values).
+	}
+
+	return cr
+}
+
+func extractBlobNames(body string, max int) []string {
+	var names []string
+	rest := body
+	for len(names) < max {
+		s := strings.Index(rest, "<Name>")
+		e := strings.Index(rest, "</Name>")
+		if s < 0 || e < 0 || e <= s {
+			break
+		}
+		names = append(names, rest[s+6:e])
+		rest = rest[e+7:]
+	}
+	return names
+}
+
 // ── Authenticated probe (az CLI) ──────────────────────────────────────────────
 
 func probeAz(r *Result, accountName string) {
 	r.AuthChecked = true
 
-	// az CLI startup is slow; give it a generous timeout.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -289,7 +430,6 @@ func probeAz(r *Result, accountName string) {
 	_ = json.Unmarshal(stdout.Bytes(), &r.AuthContainers)
 }
 
-// checkAzCLI verifies that the az CLI is available in PATH.
 func checkAzCLI() error {
 	if _, err := exec.LookPath("az"); err != nil {
 		return fmt.Errorf("'az' CLI not found in PATH\nInstall: https://aka.ms/installazurecli")
@@ -297,12 +437,10 @@ func checkAzCLI() error {
 	return nil
 }
 
-// ensureAzLogin checks for an active session and runs 'az login' if needed.
 func ensureAzLogin(quiet bool) error {
 	cmd := exec.Command("az", "account", "show", "--output", "none")
 	if err := cmd.Run(); err == nil {
 		if !quiet {
-			// Show which account/tenant is active
 			out, _ := exec.Command("az", "account", "show",
 				"--query", "{user:user.name,subscription:name}",
 				"--output", "tsv").Output()
@@ -324,14 +462,11 @@ func ensureAzLogin(quiet bool) error {
 	return login.Run()
 }
 
-// extractAzError pulls a clean error message out of az CLI stderr output,
-// which can be plain text ("ERROR: ...") or JSON.
 func extractAzError(raw string) string {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return "unknown error"
 	}
-	// az sometimes emits JSON errors to stderr
 	var obj struct {
 		Code    string `json:"code"`
 		Message string `json:"message"`
@@ -348,17 +483,8 @@ func extractAzError(raw string) string {
 			return obj.Code + ": " + firstLine(obj.Message)
 		}
 	}
-	// Plain text: strip "ERROR: " prefix and return first line
 	line := firstLine(raw)
-	line = strings.TrimPrefix(line, "ERROR: ")
-	return line
-}
-
-func firstLine(s string) string {
-	if idx := strings.IndexByte(s, '\n'); idx >= 0 {
-		return strings.TrimSpace(s[:idx])
-	}
-	return strings.TrimSpace(s)
+	return strings.TrimPrefix(line, "ERROR: ")
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -370,6 +496,25 @@ func extractAzureError(body string) string {
 		return body[start+6 : end]
 	}
 	return ""
+}
+
+func loadWordlist(path string) ([]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var lines []string
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		lines = append(lines, line)
+	}
+	return lines, scanner.Err()
 }
 
 func buildResolverPool(path string, timeout time.Duration) (*resolverPool, error) {
@@ -412,6 +557,13 @@ func makeResolver(addr string, timeout time.Duration) *net.Resolver {
 	}
 }
 
+func firstLine(s string) string {
+	if idx := strings.IndexByte(s, '\n'); idx >= 0 {
+		return strings.TrimSpace(s[:idx])
+	}
+	return strings.TrimSpace(s)
+}
+
 // ── Output ────────────────────────────────────────────────────────────────────
 
 func formatResult(r Result) string {
@@ -427,33 +579,60 @@ func formatResult(r Result) string {
 	if access == "" {
 		access = "no HTTP response"
 	}
-	line := fmt.Sprintf("%s %s%s  ip=%-16s  %s", tag, r.Name, blobSuffix, r.IP, access)
 
-	if !r.AuthChecked {
-		return line
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("%s %s%s  ip=%-16s  %s", tag, r.Name, blobSuffix, r.IP, access))
+
+	if len(r.Containers) > 0 && r.AccountBlocked {
+		sb.WriteString("\n    [!] account-level Block Public Access active — container 403s do not confirm existence")
+	}
+	for _, cr := range r.Containers {
+		sb.WriteString("\n    " + formatContainerResult(cr, r.AccountBlocked))
 	}
 
-	var authLine string
-	if r.AuthOK {
-		if len(r.AuthContainers) == 0 {
-			authLine = "    [AUTH] ACCESS GRANTED — no containers found (account may be empty)"
-		} else {
-			parts := make([]string, 0, len(r.AuthContainers))
-			for _, c := range r.AuthContainers {
-				access := c.Properties.PublicAccess
-				if access == "" {
-					access = "private"
+	if r.AuthChecked {
+		if r.AuthOK {
+			if len(r.AuthContainers) == 0 {
+				sb.WriteString("\n    [AUTH] ACCESS GRANTED — no containers found (account may be empty)")
+			} else {
+				parts := make([]string, 0, len(r.AuthContainers))
+				for _, c := range r.AuthContainers {
+					acc := c.Properties.PublicAccess
+					if acc == "" {
+						acc = "private"
+					}
+					parts = append(parts, fmt.Sprintf("%s(%s)", c.Name, acc))
 				}
-				parts = append(parts, fmt.Sprintf("%s(%s)", c.Name, access))
+				sb.WriteString(fmt.Sprintf("\n    [AUTH] ACCESS GRANTED — %d container(s): %s",
+					len(r.AuthContainers), strings.Join(parts, ", ")))
 			}
-			authLine = fmt.Sprintf("    [AUTH] ACCESS GRANTED — %d container(s): %s",
-				len(r.AuthContainers), strings.Join(parts, ", "))
+		} else {
+			sb.WriteString("\n    [AUTH] access denied — " + r.AuthMsg)
 		}
-	} else {
-		authLine = "    [AUTH] access denied — " + r.AuthMsg
 	}
 
-	return line + "\n" + authLine
+	return sb.String()
+}
+
+func formatContainerResult(cr ContainerResult, accountBlocked bool) string {
+	switch {
+	case cr.IsPublic:
+		if cr.BlobCount == 0 {
+			return fmt.Sprintf("[PUB] /%s  → container is public (empty)", cr.Name)
+		}
+		line := fmt.Sprintf("[PUB] /%s  → PUBLIC — %d blob(s)", cr.Name, cr.BlobCount)
+		if len(cr.SampleBlobs) > 0 {
+			line += ": " + strings.Join(cr.SampleBlobs, ", ")
+		}
+		return line
+	case cr.Denied && accountBlocked:
+		// 403 caused by account-level policy — cannot confirm container existence.
+		return fmt.Sprintf("[BLK] /%s  → 403 %s (account policy, not container-specific)", cr.Name, cr.Msg)
+	case cr.Denied:
+		return fmt.Sprintf("[---] /%s  → 403 %s", cr.Name, cr.Msg)
+	default:
+		return fmt.Sprintf("[ c ] /%s  → not found", cr.Name)
+	}
 }
 
 func printBanner() {
