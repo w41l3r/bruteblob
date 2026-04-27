@@ -2,14 +2,15 @@
 
 Azure Blob Storage enumerator for bug bounty and security research.
 
-Exploits the fact that `<name>.blob.core.windows.net` only resolves via DNS if the storage account actually exists. Non-existent accounts return NXDOMAIN. This allows fast, low-noise enumeration using a wordlist, followed by an HTTP probe to classify the access level and an optional container brute-force on every confirmed account.
+Exploits the fact that `<name>.blob.core.windows.net` only resolves via DNS if the storage account actually exists. Non-existent accounts return NXDOMAIN. This allows fast, low-noise enumeration using a wordlist, followed by an HTTP probe to classify the access level and optional container brute-force and write-permission checks on every confirmed account.
 
 ## How it works
 
 1. **DNS probe** — resolves `<word>.blob.core.windows.net`. Success means the storage account exists.
 2. **HTTP probe** — requests `/?comp=list` at account level to classify access (public listing, private, or blocked).
 3. **Container brute-force** *(optional, `-containers`)* — for every confirmed account, tests each word in the container wordlist as a container name via `/<container>?restype=container&comp=list`.
-4. **Authenticated probe** *(optional, `-auth`)* — runs `az storage container list --auth-mode login` using the active Azure CLI session to test access with real credentials.
+4. **Write permission check** *(optional, `-check-write`)* — for every confirmed container, attempts an anonymous `PUT` of a temporary blob and immediately `DELETE`s it on success.
+5. **Authenticated probe** *(optional, `-auth`)* — runs `az storage container list --auth-mode login` using the active Azure CLI session to test access with real credentials.
 
 ## Installation
 
@@ -43,6 +44,7 @@ For authenticated mode, also install the [Azure CLI](https://aka.ms/installazure
 | `-suffix` | — | Suffix to append to every word (e.g. `-prod`) |
 | `-found` | `false` | Only print names that exist (DNS hit) |
 | `-no-http` | `false` | Skip HTTP probe, DNS enumeration only |
+| `-check-write` | `false` | Test anonymous write access on discovered containers (PUT + immediate DELETE) |
 | `-auth` | `false` | Authenticated mode: test access via `az` CLI credentials |
 | `-o` | — | Save hits to output file (only writes DNS hits) |
 | `-q` | `false` | Quiet mode — suppress banner and summary |
@@ -59,8 +61,14 @@ For authenticated mode, also install the [Azure CLI](https://aka.ms/installazure
 # Container brute-force on found accounts
 ./bruteblob -w wordlist.txt -containers wordlists/containers.txt -found
 
+# Container brute-force + write check
+./bruteblob -w wordlist.txt -containers wordlists/containers.txt -check-write -found
+
 # Target-specific: prefix + container brute + auth
 ./bruteblob -w words.txt -prefix "acme-" -containers wordlists/containers.txt -auth -found
+
+# Full pipeline: containers + write check + auth
+./bruteblob -w words.txt -prefix "acme-" -containers wordlists/containers.txt -check-write -auth -found
 
 # Custom resolvers + container brute, full pipeline
 ./bruteblob -w wordlist.txt -r resolvers.txt -containers wordlists/containers.txt -t 30 -container-threads 20 -found -o hits.txt -q
@@ -86,6 +94,20 @@ For authenticated mode, also install the [Azure CLI](https://aka.ms/installazure
     [PUB] /data     → PUBLIC — 34 blob(s): report.csv, dump.sql, keys.json, ...
     [PUB] /logs     → PUBLIC — 8 blob(s): app-2024.log, error.log, ...
     [---] /private  → 403 AuthorizationFailure
+
+[*] done — checked: 560 | found: 3 | public: 1
+```
+
+### With write check (`-check-write`)
+
+```
+[!] target-backup.blob.core.windows.net    ip=20.60.x.x    ANONYMOUS LISTING — containers exposed
+    [PUB] /data     → PUBLIC — 34 blob(s): report.csv, dump.sql, keys.json, ...
+    [WR!] /data     → write access confirmed — blob uploaded and deleted
+    [PUB] /logs     → PUBLIC — 8 blob(s): app-2024.log, error.log, ...
+    [---] /private  → 403 AuthorizationFailure
+
+[*] done — checked: 560 | found: 3 | public: 1 | write-access: 1
 ```
 
 ### Authenticated mode (`-auth`) with container brute-force
@@ -107,6 +129,7 @@ For authenticated mode, also install the [Azure CLI](https://aka.ms/installazure
 | `[PUB]` | Container exists and is **publicly listable** — blobs exposed |
 | `[---]` | Container exists but access denied (403 container-specific) |
 | `[BLK]` | 403 caused by **account-level Block Public Access** — cannot confirm container existence |
+| `[WR!]` | **Anonymous write confirmed** — blob uploaded and deleted (critical finding) |
 | `[AUTH] ACCESS GRANTED` | Authenticated access confirmed — container list included |
 | `[AUTH] access denied` | Credentials don't have access to this account |
 
@@ -134,6 +157,27 @@ The tool detects this automatically:
 - A warning line is printed before the container list: `[!] account-level Block Public Access active — container 403s do not confirm existence`
 
 In this scenario, container brute-force is still useful when combined with `-auth`, since authenticated requests bypass the public access restriction and can confirm existence.
+
+## Write permission check (`-check-write`)
+
+When `-check-write` is set, the tool tests anonymous write access on every confirmed container by sending:
+
+```
+PUT https://<account>.blob.core.windows.net/<container>/bruteblob-writetest-<timestamp>.txt
+x-ms-blob-type: BlockBlob
+Content-Type: text/plain
+Body: security-research-write-test
+```
+
+| Response | Meaning |
+|----------|---------|
+| `201 Created` | **Write allowed** — the blob was uploaded; a `DELETE` is immediately sent to clean up |
+| `403` | Write denied (anonymous write not allowed) |
+| `409` | Account-level policy blocks the request |
+
+Write is tested on every container that returned a signal (`[PUB]` or `[---]`). Containers under accounts with `[BLK]` will also be probed — they are expected to fail, but attempting costs nothing and avoids false negatives in edge cases.
+
+> **Impact**: Anonymous write in Azure Blob Storage allows uploading arbitrary files, potential defacement of `$web` static sites, and data injection into processing pipelines. Always report as critical severity.
 
 ## HTTP status reference
 
@@ -179,6 +223,7 @@ outer pool (-t threads)
        └─ if account exists + -containers set:
             inner pool (-container-threads per account)
               └─ per container: GET ?restype=container&comp=list
+                   └─ if -check-write set: PUT blob → DELETE blob
        └─ if -auth set:
             az storage container list (30 s timeout)
 ```
@@ -210,7 +255,7 @@ Queries are distributed across all resolvers in round-robin order. When `-r` is 
 - Pre-built wordlists: `wordlists/tim-brasil.txt` (560 entries), `wordlists/sek-group.txt` (608 entries)
 
 ### Container names (`-containers`)
-- Use `wordlists/containers.txt` as a starting point — covers logs, backups, config, secrets, environments, databases, and more (189 entries)
+- Use `wordlists/containers.txt` as a starting point — covers logs, backups, config, secrets, environments, databases, and more (200 entries)
 - Add target-specific container names: app name, service name, team names, internal codenames
 - Note: Azure container names must be lowercase and 3–63 characters
 

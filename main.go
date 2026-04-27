@@ -35,9 +35,11 @@ type ContainerResult struct {
 	Name        string
 	IsPublic    bool
 	Denied      bool
-	BlobCount   int
-	SampleBlobs []string
-	Msg         string // Azure error code when denied
+	BlobCount    int
+	SampleBlobs  []string
+	Msg          string // Azure error code when denied
+	WriteAllowed bool
+	WriteMsg     string
 }
 
 type Result struct {
@@ -83,6 +85,7 @@ var (
 	flagSuffix        = flag.String("suffix", "", "suffix to append to every word (e.g. -prod)")
 	flagNoHTTP        = flag.Bool("no-http", false, "skip HTTP probe (DNS enumeration only)")
 	flagAuth          = flag.Bool("auth", false, "authenticated mode: use 'az' CLI to test access with Azure credentials")
+	flagCheckWrite    = flag.Bool("check-write", false, "test anonymous write access on discovered containers (PUT + immediate DELETE)")
 )
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -189,7 +192,7 @@ func main() {
 		close(jobs)
 	}()
 
-	total, found, public, authOK := 0, 0, 0, 0
+	total, found, public, authOK, writeOK := 0, 0, 0, 0, 0
 	for r := range results {
 		total++
 		if *flagOnlyFound && !r.Exists {
@@ -204,6 +207,11 @@ func main() {
 		if r.AuthOK {
 			authOK++
 		}
+		for _, cr := range r.Containers {
+			if cr.WriteAllowed {
+				writeOK++
+			}
+		}
 		out := formatResult(r)
 		fmt.Println(out)
 		if outFile != nil && r.Exists {
@@ -213,6 +221,9 @@ func main() {
 
 	if !*flagQuiet {
 		summary := fmt.Sprintf("\n[*] done — checked: %d | found: %d | public: %d", total, found, public)
+		if *flagCheckWrite {
+			summary += fmt.Sprintf(" | write-access: %d", writeOK)
+		}
 		if *flagAuth {
 			summary += fmt.Sprintf(" | auth-access: %d", authOK)
 		}
@@ -386,7 +397,44 @@ func probeOneContainer(accountName, containerName string, client *http.Client) C
 	// 404 = container does not exist → drop silently (cr has zero values).
 	}
 
+	if (cr.IsPublic || cr.Denied) && *flagCheckWrite {
+		cr.WriteAllowed, cr.WriteMsg = probeWriteBlob(accountName, containerName, client)
+	}
+
 	return cr
+}
+
+// probeWriteBlob tests whether anonymous PUT is allowed on the container.
+// On HTTP 201 it immediately DELETEs the blob to clean up.
+func probeWriteBlob(accountName, containerName string, client *http.Client) (bool, string) {
+	blobName := fmt.Sprintf("bruteblob-writetest-%d.txt", time.Now().UnixNano())
+	targetURL := fmt.Sprintf("https://%s%s/%s/%s", accountName, blobSuffix, containerName, blobName)
+	payload := "security-research-write-test"
+
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPut, targetURL,
+		strings.NewReader(payload))
+	req.Header.Set("Content-Type", "text/plain")
+	req.Header.Set("x-ms-blob-type", "BlockBlob")
+	req.ContentLength = int64(len(payload))
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return false, ""
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode == 201 {
+		delReq, _ := http.NewRequestWithContext(context.Background(), http.MethodDelete, targetURL, nil)
+		delResp, err := client.Do(delReq)
+		if err == nil {
+			io.Copy(io.Discard, delResp.Body)
+			delResp.Body.Close()
+		}
+		return true, "write access confirmed — blob uploaded and deleted"
+	}
+
+	return false, ""
 }
 
 func extractBlobNames(body string, max int) []string {
@@ -588,6 +636,9 @@ func formatResult(r Result) string {
 	}
 	for _, cr := range r.Containers {
 		sb.WriteString("\n    " + formatContainerResult(cr, r.AccountBlocked))
+		if cr.WriteAllowed {
+			sb.WriteString(fmt.Sprintf("\n    [WR!] /%s  → %s", cr.Name, cr.WriteMsg))
+		}
 	}
 
 	if r.AuthChecked {
